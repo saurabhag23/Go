@@ -1,4 +1,4 @@
-module usr/local/go/src/saurabhagrawal/Desktop/Go
+module github.com/saurabhag23/Go
 
 go 1.22.0
 
