@@ -1,0 +1,114 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+)
+
+type User struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
+type RateLimiter struct {
+	requests map[string]int
+	reset    map[string]time.Time
+	lock     sync.Mutex
+}
+
+func NewRateLimiter() *RateLimiter {
+	return &RateLimiter{
+		requests: make(map[string]int),
+		reset:    make(map[string]time.Time),
+		lock:     sync.Mutex{},
+	}
+}
+
+// VerifyToken checks the token and extracts claims
+func VerifyToken(tokenStr string, signingKey []byte) (jwt.MapClaims, bool) {
+	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return signingKey, nil
+	})
+
+	if err != nil {
+		fmt.Println("Token parsing error:", err)
+		return nil, false
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		return claims, true
+	}
+
+	return nil, false
+}
+
+// Limit applies rate limiting based on JWT claims
+func (rl *RateLimiter) Limit(signingKey []byte, rateStandard, ratePro int, window time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			authHeader := r.Header.Get("Authorization")
+			if authHeader == "" {
+				http.Error(w, "Authorization header is required", http.StatusUnauthorized)
+				return
+			}
+
+			tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+			claims, valid := verifyToken(tokenStr, signingKey)
+			if !valid {
+				http.Error(w, "Invalid token", http.StatusUnauthorized)
+				return
+			}
+
+			userID, ok := claims["user_id"].(string)
+			if !ok {
+				http.Error(w, "Invalid token claims: user_id missing", http.StatusBadRequest)
+				return
+			}
+
+			rl.lock.Lock()
+			defer rl.lock.Unlock()
+
+			if _, exists := rl.requests[userID]; !exists {
+				rl.reset[userID] = time.Now().Add(window)
+			}
+
+			if time.Now().After(rl.reset[userID]) {
+				rl.requests[userID] = 0
+				rl.reset[userID] = time.Now().Add(window)
+			}
+
+			rate := rateStandard
+			if plan, ok := claims["plan"].(string); ok && plan == "pro" {
+				rate = ratePro
+			}
+
+			if rl.requests[userID] >= rate {
+				http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+				return
+			}
+
+			rl.requests[userID]++
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func UsersHandler(w http.ResponseWriter, r *http.Request) {
+	users := []User{
+		{ID: 1, Name: "Alice"},
+		{ID: 2, Name: "Bob"},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(users)
+}
